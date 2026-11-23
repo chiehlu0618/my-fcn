@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+FCN 儀表板 — 美股／日股收盤報價抓取（後端批次，供 GitHub Actions 每日自動執行）
+
+做法：伺服器端直接打 Yahoo Finance 公開端點（無 CORS 問題、免金鑰、免代理），
+取得每檔標的的「現價」與「近 2 年每日最高／最低」（KI/KO 判斷用），寫出 data/prices.json。
+網頁只要讀這個檔，就不必再靠不穩定的 allorigins 代理。
+
+symbol 規則：日股用「代號.T」(6146.T)；美股用原代號，class 股把點改成連字號（BRK.B -> BRK-B）。
+執行：python scripts/fetch_prices.py
+"""
+import csv
+import json
+import os
+import sys
+import time
+import urllib.request
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; fcn-dashboard/1.0; personal research)"}
+
+# 基礎清單（與網頁 stockNames 一致）；實際會再併入 data.csv 裡出現的代號
+BASE_SYMBOLS = [
+    # 日股
+    "6146.T", "6501.T", "7011.T", "6857.T", "7012.T", "7013.T", "7974.T",
+    "8035.T", "5802.T", "5803.T", "8697.T", "8002.T", "285A.T", "4063.T", "6758.T",
+    "9984.T", "9501.T", "6920.T", "6954.T", "6981.T", "8306.T", "7203.T",
+    # 美股：大型科技 / AI
+    "NVDA", "TSLA", "TSM", "AMD", "MU", "ARM", "GOOG", "GOOGL", "AMZN",
+    "AVGO", "MSFT", "META", "DELL", "ORCL", "OKLO", "PLTR", "NFLX",
+    "BRK.B", "AAPL", "UBER", "COIN", "MSTR", "CRWD", "ANET", "VST", "CEG",
+    # 美股：半導體設備 / 供應鏈
+    "AMAT", "LRCX", "KLAC", "ASML", "INTC", "QCOM", "MRVL", "SMCI",
+    "GLW", "LITE", "SNDK",
+    # ETF
+    "QQQ", "SPY", "SOXX",
+]
+
+
+def yahoo_symbol(sym):
+    """把資料裡的代號轉成 Yahoo 用的代號（日股 .T 保留；美股 class 股的 . 轉 -）"""
+    s = str(sym).strip()
+    return s if s.endswith(".T") else s.replace(".", "-")
+
+
+def symbols_from_extra():
+    """從 extra_symbols.txt 讀出使用者在詢價系統臨時加入的標的（一行一個代號）"""
+    found = set()
+    path = os.path.join(ROOT, "extra_symbols.txt")
+    if not os.path.exists(path):
+        return found
+    try:
+        with open(path, encoding="utf-8-sig") as f:
+            for line in f:
+                c = line.strip().upper()
+                if c and not c.startswith("#"):
+                    found.add(c)
+    except Exception as e:  # noqa
+        print(f"讀 extra_symbols.txt 失敗：{e}")
+    return found
+
+
+def symbols_from_csv():
+    """從 data.csv 讀出實際持有標的（s1_code~s4_code），確保新加的股也會被抓到"""
+    found = set()
+    path = os.path.join(ROOT, "data.csv")
+    if not os.path.exists(path):
+        return found
+    try:
+        with open(path, encoding="utf-8-sig", newline="") as f:
+            for row in csv.DictReader(f):
+                for i in range(1, 5):
+                    c = (row.get(f"s{i}_code") or "").strip()
+                    if c:
+                        found.add(c)
+    except Exception as e:  # noqa
+        print(f"  讀 data.csv 失敗（略過）: {e}", file=sys.stderr)
+    return found
+
+
+def fetch_chart(sym, retries=3):
+    """回傳 {current, timestamp[], high[], low[]}；失敗回 None"""
+    ysym = yahoo_symbol(sym)
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ysym}?interval=1d&range=2y"
+    for i in range(retries):
+        try:
+            req = urllib.request.Request(url, headers=HEADERS)
+            with urllib.request.urlopen(req, timeout=30) as r:
+                j = json.loads(r.read().decode("utf-8"))
+            res = j["chart"]["result"][0]
+            meta = res["meta"]
+            q = res["indicators"]["quote"][0]
+            ts = list(res.get("timestamp") or [])
+            highs = list(q.get("high") or [])
+            lows = list(q.get("low") or [])
+            closes = list(q.get("close") or [])
+
+            # 只用「已收盤」的日收盤價，不用盤中即時價：
+            # 若該標的所屬市場此刻正在盤中，Yahoo 日K的最後一根是尚未收盤的即時K，
+            # 依各自交易時段（美股/日股皆準）判斷後直接捨棄，改用前一根已收盤的價格。
+            now = time.time()
+            reg = (meta.get("currentTradingPeriod") or {}).get("regular") or {}
+            s_start, s_end = reg.get("start"), reg.get("end")
+            market_open = bool(s_start and s_end and s_start <= now < s_end)
+            if market_open and closes:
+                ts, highs, lows, closes = ts[:-1], highs[:-1], lows[:-1], closes[:-1]
+
+            # 清掉尾端「尚未結算」的空日K：
+            # Yahoo 的日K 常在收盤後數小時才把當日收盤價填進去（實測美股約 5 小時），
+            # 在那之前最後一根的 close 是 null，會讓現價退回前一天。
+            while closes and closes[-1] is None:
+                ts, highs, lows, closes = ts[:-1], highs[:-1], lows[:-1], closes[:-1]
+
+            # 市場已收盤但日K 還沒結算時，用 regularMarketPrice（正規盤收盤價，
+            # 收盤瞬間就會更新，不含盤後交易）補上當日這一根，避免整天落後一日。
+            rmp = meta.get("regularMarketPrice")
+            rmt = meta.get("regularMarketTime")
+            if (not market_open) and rmp is not None and rmt:
+                day = lambda t: time.strftime("%Y-%m-%d", time.gmtime(t))
+                if (not ts) or day(rmt) > day(ts[-1]):
+                    ts.append(rmt)
+                    closes.append(rmp)
+                    # 當日高低尚未提供，以收盤價代入（KI/KO 判定使用收盤價）
+                    highs.append(rmp)
+                    lows.append(rmp)
+                    print(f"    （{sym} 日K未結算，改用收盤報價 {rmp} 補上 {day(rmt)}）")
+
+            # 現價 = 最後一根「已收盤」的日收盤價
+            cur = None
+            for c in reversed(closes):
+                if c is not None:
+                    cur = c
+                    break
+            if cur is None:
+                cur = meta.get("chartPreviousClose") or meta.get("previousClose") or meta.get("regularMarketPrice")
+
+            return {
+                "current": cur,
+                "prevClose": meta.get("chartPreviousClose"),
+                "currency": meta.get("currency"),
+                "market_open": market_open,
+                "timestamp": ts,
+                "high": highs,
+                "low": lows,
+                "close": closes,
+            }
+        except Exception as e:  # noqa
+            print(f"  retry {i+1}/{retries} {sym}: {e}", file=sys.stderr)
+            time.sleep(2 * (i + 1))
+    print(f"  FAILED {sym}", file=sys.stderr)
+    return None
+
+
+def main():
+    symbols = sorted(set(BASE_SYMBOLS) | symbols_from_csv() | symbols_from_extra())
+    print(f"共 {len(symbols)} 檔標的")
+    out = {}
+    ok = 0
+    for sym in symbols:
+        rec = fetch_chart(sym)
+        if rec and rec.get("current") is not None:
+            out[sym] = rec
+            ok += 1
+            print(f"  {sym}: {rec['current']} {rec.get('currency') or ''} "
+                  f"({len(rec['timestamp'])} 日歷史)")
+        time.sleep(0.6)  # 溫和節流，避免被 Yahoo 限流
+    payload = {"updated": int(time.time()), "count": ok, "prices": out}
+    with open(os.path.join(ROOT, "prices.json"), "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, separators=(",", ":"))
+    print(f"完成：{ok}/{len(symbols)} 檔寫入 prices.json")
+    if ok == 0:
+        sys.exit(1)  # 全失敗才視為錯誤（讓 Action 顯示紅燈）
+
+
+if __name__ == "__main__":
+    main()
